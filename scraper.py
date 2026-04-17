@@ -112,7 +112,8 @@ def scrape_profile(page: Page, slug: str, since: datetime) -> list[dict]:
     Visit a profile's Recent Activity page and collect posts newer than `since`.
     Returns a list of post dicts with keys: url, text, date, likes, comments, shares, score.
     """
-    url = f"{LINKEDIN_BASE}/in/{slug}/recent-activity/shares/"
+    # Use /recent-activity/all/ to capture all post types, not just shares
+    url = f"{LINKEDIN_BASE}/in/{slug}/recent-activity/all/"
     print(f"  → Visiting {url}")
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=30_000)
@@ -120,16 +121,26 @@ def scrape_profile(page: Page, slug: str, since: datetime) -> list[dict]:
         print(f"    [!] Timeout loading {url}")
         return []
 
+    # Wait for React/SPA content to hydrate before starting to scrape
+    page.wait_for_timeout(3_000)
+
     posts: list[dict] = []
     seen_urls: set[str] = set()
     scroll_attempts = 0
     max_scroll = 20  # safety limit
+    no_new_streak = 0  # consecutive scrolls with no new posts
 
     while scroll_attempts < max_scroll:
-        # Collect post containers currently in DOM
+        # Updated selectors for current LinkedIn HTML (2024-2025).
+        # LinkedIn activity feed wraps each post in a div with a data-urn attribute
+        # containing the post type. We target specific URN patterns to avoid matching
+        # unrelated elements (nav bars, sidebars, etc.).
         containers = page.locator(
-            "div.feed-shared-update-v2, div[data-urn]"
+            "div[data-urn*=':activity:'], div[data-urn*=':ugcPost:'], div[data-urn*=':share:']"
         ).all()
+        if not containers:
+            # Broader fallback: any element with a data-urn (covers edge-case layouts)
+            containers = page.locator("div[data-urn]").all()
 
         new_found = False
         for container in containers:
@@ -148,7 +159,12 @@ def scrape_profile(page: Page, slug: str, since: datetime) -> list[dict]:
             # --- Date ---
             post_date: datetime | None = None
             try:
-                time_el = container.locator("span.feed-shared-actor__sub-description span[aria-hidden]").first
+                # Try multiple selector variants across LinkedIn redesigns
+                time_el = container.locator(
+                    "span.update-components-actor__sub-description span[aria-hidden], "
+                    "span[class*='actor__sub-description'] span[aria-hidden], "
+                    "span.feed-shared-actor__sub-description span[aria-hidden]"
+                ).first
                 raw_time = time_el.inner_text(timeout=2_000).strip()
                 post_date = parse_relative_time(raw_time)
             except Exception:
@@ -160,7 +176,12 @@ def scrape_profile(page: Page, slug: str, since: datetime) -> list[dict]:
 
             # --- Text ---
             try:
-                text_el = container.locator("div.feed-shared-update-v2__description, span.break-words").first
+                text_el = container.locator(
+                    "div.update-components-text, "
+                    "div[class*='commentary'], "
+                    "div.feed-shared-update-v2__description, "
+                    "span.break-words"
+                ).first
                 text = text_el.inner_text(timeout=2_000).strip()[:500]
             except Exception:
                 text = ""
@@ -168,7 +189,10 @@ def scrape_profile(page: Page, slug: str, since: datetime) -> list[dict]:
             # --- Engagement counts ---
             likes = comments = shares = 0
             try:
-                reaction_el = container.locator("span.social-details-social-counts__reactions-count").first
+                reaction_el = container.locator(
+                    "span.social-details-social-counts__reactions-count, "
+                    "span[class*='social-counts__reactions-count']"
+                ).first
                 likes = parse_count(reaction_el.inner_text(timeout=2_000))
             except Exception:
                 pass
@@ -206,11 +230,16 @@ def scrape_profile(page: Page, slug: str, since: datetime) -> list[dict]:
             new_found = True
 
         if not new_found:
-            break
+            no_new_streak += 1
+            if no_new_streak >= 3:
+                # Three consecutive scrolls with no new posts — we've hit the bottom
+                break
+        else:
+            no_new_streak = 0
 
         # Scroll down to load more posts
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(2_000)
+        page.wait_for_timeout(2_500)
         scroll_attempts += 1
 
     return posts
