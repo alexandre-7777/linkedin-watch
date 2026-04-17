@@ -1,0 +1,8 @@
+# LinkedIn profiles to watch — one per line
+# Accepted formats: full URL or slug
+# Example:
+# https://www.linkedin.com/in/williamhgates
+# jeffweiner08
+
+williamhgates
+jeffweiner08
