@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-"""Weekly Reddit editorial digest — fetches top posts, summarizes with Claude, sends via Gmail."""
+"""Weekly Reddit editorial digest — fetches top posts, summarizes with Claude, posts to Slack."""
 
 import os
 import time
 import json
-import smtplib
 import urllib.request
 from datetime import datetime, timedelta
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
 import anthropic
 
@@ -24,7 +21,6 @@ SUBREDDITS = [
 MAX_AGE_SECONDS = 7 * 24 * 3600  # 7 days
 MIN_SCORE = 20
 MIN_COMMENTS = 10
-EMAIL_TO = "alexandre@web-ia.com"
 USER_AGENT = "RedditDigestBot/1.0 by alexandre@web-ia.com"
 
 
@@ -61,38 +57,28 @@ def build_posts_text(subreddit: str, posts: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def generate_digest(subreddit_posts: dict[str, list[dict]]) -> str:
+def generate_digest(subreddit_posts: dict[str, list[dict]], date_fr: str) -> str:
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-    monday = datetime.now() - timedelta(days=datetime.now().weekday())
-    months_fr = [
-        "janvier", "février", "mars", "avril", "mai", "juin",
-        "juillet", "août", "septembre", "octobre", "novembre", "décembre",
+    content_blocks = [
+        build_posts_text(sub, posts)
+        for sub, posts in subreddit_posts.items()
+        if posts
     ]
-    date_fr = f"{monday.day} {months_fr[monday.month - 1]} {monday.year}"
-
-    content_blocks = []
-    for sub, posts in subreddit_posts.items():
-        if posts:
-            content_blocks.append(build_posts_text(sub, posts))
-
-    if not content_blocks:
-        return ""
 
     prompt = f"""Tu es un rédacteur de revue de presse tech pour Alexandre.
 Voici les posts Reddit notables de la semaine (score > {MIN_SCORE} ou > {MIN_COMMENTS} commentaires, moins de 7 jours) :
 
 {chr(10).join(content_blocks)}
 
-Rédige une revue de presse hebdomadaire en français :
-- Objet: Revue Reddit - semaine du {date_fr}
-- Format email (texte enrichi)
-- Commence par "Bonjour Alexandre,"
-- Une section par subreddit avec du contenu notable
-- Pour chaque post retenu : titre cliquable, 2-3 phrases éditoriales (sujet, pourquoi notable, réaction communauté)
+Rédige une revue de presse hebdomadaire en français pour Slack :
+- Commence par : *Revue Reddit — semaine du {date_fr}*
+- Une section par subreddit avec du contenu notable (utilise *bold* pour les titres Slack)
+- Pour chaque post retenu : titre avec lien cliquable, 2-3 phrases éditoriales (sujet, pourquoi notable, réaction communauté)
 - Ignore les subreddits sans posts qualifiants
-- Termine par "Prochain digest : vendredi prochain à 7h."
+- Termine par : _Prochain digest : vendredi prochain à 7h._
 - Sois sélectif et éditorial : 3 excellents items valent mieux que 15 médiocres
+- Utilise les emojis Slack avec parcimonie pour structurer (ex: 📝 📢 🧠)
 """
 
     message = client.messages.create(
@@ -103,20 +89,17 @@ Rédige une revue de presse hebdomadaire en français :
     return message.content[0].text
 
 
-def send_email(subject: str, body: str):
-    gmail_user = os.environ["GMAIL_USER"]
-    gmail_password = os.environ["GMAIL_APP_PASSWORD"]
-
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = gmail_user
-    msg["To"] = EMAIL_TO
-    msg.attach(MIMEText(body, "plain", "utf-8"))
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(gmail_user, gmail_password)
-        server.sendmail(gmail_user, EMAIL_TO, msg.as_string())
-    print(f"Email envoyé à {EMAIL_TO}")
+def post_to_slack(text: str):
+    webhook_url = os.environ["SLACK_WEBHOOK_URL"]
+    payload = json.dumps({"text": text}).encode("utf-8")
+    req = urllib.request.Request(
+        webhook_url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        print(f"Slack response: {resp.status}")
 
 
 def main():
@@ -136,14 +119,7 @@ def main():
 
     total = sum(len(p) for p in subreddit_posts.values())
     if total == 0:
-        print("Aucun post qualifiant cette semaine. Email non envoyé.")
-        return
-
-    print("Génération du digest avec Claude...")
-    digest = generate_digest(subreddit_posts)
-
-    if not digest:
-        print("Digest vide. Email non envoyé.")
+        print("Aucun post qualifiant cette semaine. Message non envoyé.")
         return
 
     monday = datetime.now() - timedelta(days=datetime.now().weekday())
@@ -152,10 +128,16 @@ def main():
         "juillet", "août", "septembre", "octobre", "novembre", "décembre",
     ]
     date_fr = f"{monday.day} {months_fr[monday.month - 1]} {monday.year}"
-    subject = f"Revue Reddit - semaine du {date_fr}"
 
-    print(f"Envoi de l'email : {subject}")
-    send_email(subject, digest)
+    print("Génération du digest avec Claude...")
+    digest = generate_digest(subreddit_posts, date_fr)
+
+    if not digest:
+        print("Digest vide. Message non envoyé.")
+        return
+
+    print("Envoi sur Slack...")
+    post_to_slack(digest)
     print("Terminé.")
 
 
