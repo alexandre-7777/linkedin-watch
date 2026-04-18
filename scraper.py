@@ -3,13 +3,10 @@
 LinkedIn Watch — scrape the top 3 most-engaged posts (last 15 days) per profile.
 
 Usage:
-    python scraper.py [--profiles profiles.txt] [--output report.md] [--days 15]
-    python scraper.py --headless          # run browser in headless mode
-    python scraper.py --cookies cookies.json  # load saved auth cookies
-
-LinkedIn requires authentication. On the first run, the browser opens so you can
-log in manually. Cookies are then saved to linkedin_cookies.json so subsequent
-runs are headless.
+    python scraper.py                     # login window opens on first run
+    python scraper.py --headless          # headless after cookies are saved
+    python scraper.py --debug             # saves page.html + screenshot per profile
+    python scraper.py --days 15 --top 3
 """
 
 import argparse
@@ -22,35 +19,29 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright, Page, BrowserContext, TimeoutError as PWTimeout
 
 
+LINKEDIN_BASE = "https://www.linkedin.com"
+COOKIE_FILE = Path("linkedin_cookies.json")
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-LINKEDIN_BASE = "https://www.linkedin.com"
-COOKIE_FILE = Path("linkedin_cookies.json")
-
-
 def parse_profiles(path: Path) -> list[str]:
-    """Return a list of LinkedIn slugs from a profiles file."""
     slugs = []
     for line in path.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        # Accept full URLs or bare slugs
         m = re.search(r"linkedin\.com/in/([^/?\s]+)", line)
         slugs.append(m.group(1) if m else line)
     return slugs
 
 
 def parse_relative_time(text: str) -> datetime | None:
-    """
-    Parse LinkedIn's relative timestamps ("2d", "1w", "3h", "just now", …)
-    into an absolute UTC datetime. Returns None when the string is unrecognised.
-    """
+    """Parse LinkedIn relative timestamps like '2d', '1w', '3h' → UTC datetime."""
     now = datetime.now(timezone.utc)
     text = text.lower().strip()
-    if "just now" in text or "now" == text:
+    if not text or text in ("now", "just now"):
         return now
     m = re.search(r"(\d+)\s*([smhdw])", text)
     if not m:
@@ -61,9 +52,9 @@ def parse_relative_time(text: str) -> datetime | None:
 
 
 def parse_count(text: str) -> int:
-    """Parse '1,234', '2.3K', '1M' etc. into an integer."""
-    text = text.strip().replace(",", "").replace("\u202f", "")
-    m = re.fullmatch(r"([\d.]+)\s*([KkMm]?)", text)
+    """Parse '1,234', '2.3K', '1M' → int."""
+    text = re.sub(r"[^\d.KkMm]", "", text.strip())
+    m = re.fullmatch(r"([\d.]+)([KkMm]?)", text)
     if not m:
         return 0
     value = float(m.group(1))
@@ -80,144 +71,191 @@ def save_cookies(context: BrowserContext, path: Path) -> None:
 
 
 def load_cookies(context: BrowserContext, path: Path) -> None:
-    cookies = json.loads(path.read_text())
-    context.add_cookies(cookies)
+    context.add_cookies(json.loads(path.read_text()))
 
 
 def ensure_logged_in(page: Page, context: BrowserContext, cookie_file: Path) -> None:
-    """Navigate to LinkedIn; if not authenticated, wait for the user to log in."""
-    page.goto(f"{LINKEDIN_BASE}/feed/", wait_until="domcontentloaded")
+    page.goto(f"{LINKEDIN_BASE}/feed/", wait_until="domcontentloaded", timeout=30_000)
 
-    # Detect login wall
-    if "/login" in page.url or page.locator("input#username").is_visible():
+    if "/login" in page.url or "/authwall" in page.url or page.locator("input#username").is_visible():
         print(
             "\n[!] LinkedIn requires you to log in.\n"
-            "    Complete the login in the browser that just opened, then press Enter here.",
+            "    Complete the login in the browser window, then press Enter here.",
             flush=True,
         )
         input()
-        # Wait until we're back at the feed
         page.wait_for_url(f"{LINKEDIN_BASE}/feed/**", timeout=120_000)
 
     save_cookies(context, cookie_file)
-    print(f"[✓] Authenticated. Cookies saved to {cookie_file}")
+    print(f"[✓] Authenticated — cookies saved to {cookie_file}")
 
 
 # ---------------------------------------------------------------------------
 # Scraping
 # ---------------------------------------------------------------------------
 
-def scrape_profile(page: Page, slug: str, since: datetime) -> list[dict]:
-    """
-    Visit a profile's Recent Activity page and collect posts newer than `since`.
-    Returns a list of post dicts with keys: url, text, date, likes, comments, shares, score.
-    """
+# Candidate selectors for post containers — tried in order, first match wins.
+# LinkedIn changes its class names frequently; using data-urn is more stable.
+POST_CONTAINER_SELECTORS = [
+    "[data-urn*='urn:li:activity']",          # most reliable: data attribute with activity URN
+    "[data-id*='urn:li:activity']",
+    "div.occludable-update",                   # feed items (2024+)
+    "div.feed-shared-update-v2",               # older class name
+]
+
+TEXT_SELECTORS = [
+    "div.feed-shared-text span[dir]",
+    "div.attributed-text-segment-list__content",
+    "div.feed-shared-update-v2__description",
+    "span.break-words",
+    "div.update-components-text",
+]
+
+TIME_SELECTORS = [
+    "span.update-components-actor__sub-description span[aria-hidden='true']",
+    "span.feed-shared-actor__sub-description span[aria-hidden='true']",
+    "time",
+]
+
+
+def _first_text(container, selectors: list[str], timeout: int = 2_000) -> str:
+    for sel in selectors:
+        try:
+            el = container.locator(sel).first
+            if el.count() > 0:
+                return el.inner_text(timeout=timeout).strip()
+        except Exception:
+            pass
+    return ""
+
+
+def _extract_count_from_aria(container, keyword: str) -> int:
+    """Find a button/element whose aria-label contains keyword and extract the number."""
+    try:
+        # aria-label typically looks like "123 comments" or "View 1,234 reactions"
+        els = container.locator(f"[aria-label*='{keyword}']").all()
+        for el in els:
+            label = el.get_attribute("aria-label") or ""
+            m = re.search(r"([\d,. KkMm]+)", label)
+            if m:
+                return parse_count(m.group(1))
+    except Exception:
+        pass
+    return 0
+
+
+def scrape_profile(page: Page, slug: str, since: datetime, debug: bool = False) -> list[dict]:
     url = f"{LINKEDIN_BASE}/in/{slug}/recent-activity/shares/"
-    print(f"  → Visiting {url}")
+    print(f"  → {url}")
+
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=30_000)
     except PWTimeout:
-        print(f"    [!] Timeout loading {url}")
+        print("    [!] Timeout loading page")
         return []
+
+    # Wait for at least one post container to appear
+    loaded = False
+    for sel in POST_CONTAINER_SELECTORS:
+        try:
+            page.wait_for_selector(sel, timeout=8_000)
+            print(f"    [✓] Posts detected with selector: {sel}")
+            loaded = True
+            break
+        except PWTimeout:
+            continue
+
+    if not loaded:
+        print("    [!] No post containers found — page may require different selectors.")
+        if debug:
+            _save_debug(page, slug)
+        return []
+
+    if debug:
+        _save_debug(page, slug)
+
+    # Determine which selector found posts
+    active_sel = next(
+        (s for s in POST_CONTAINER_SELECTORS if page.locator(s).count() > 0),
+        POST_CONTAINER_SELECTORS[0],
+    )
 
     posts: list[dict] = []
     seen_urls: set[str] = set()
+    prev_count = 0
     scroll_attempts = 0
-    max_scroll = 20  # safety limit
+    max_scroll = 25
 
     while scroll_attempts < max_scroll:
-        # Collect post containers currently in DOM
-        containers = page.locator(
-            "div.feed-shared-update-v2, div[data-urn]"
-        ).all()
+        containers = page.locator(active_sel).all()
 
-        new_found = False
         for container in containers:
-            # --- Post URL / ID ---
+            # Post URL
+            post_url = ""
             try:
-                link_el = container.locator("a[href*='/posts/'], a[href*='/feed/update/']").first
-                href = link_el.get_attribute("href") or ""
-                post_url = href.split("?")[0]
+                link = container.locator("a[href*='/posts/'], a[href*='/feed/update/']").first
+                href = link.get_attribute("href") or ""
+                post_url = href.split("?")[0].strip()
             except Exception:
-                post_url = ""
+                pass
 
             if not post_url or post_url in seen_urls:
                 continue
             seen_urls.add(post_url)
 
-            # --- Date ---
-            post_date: datetime | None = None
-            try:
-                time_el = container.locator("span.feed-shared-actor__sub-description span[aria-hidden]").first
-                raw_time = time_el.inner_text(timeout=2_000).strip()
-                post_date = parse_relative_time(raw_time)
-            except Exception:
-                pass
+            # Date
+            raw_time = _first_text(container, TIME_SELECTORS)
+            post_date = parse_relative_time(raw_time) if raw_time else None
 
-            if post_date and post_date < since:
-                # Posts are roughly chronological; once we hit old content stop
+            # Skip posts older than the window (but keep date-unknown posts)
+            if post_date is not None and post_date < since:
                 continue
 
-            # --- Text ---
-            try:
-                text_el = container.locator("div.feed-shared-update-v2__description, span.break-words").first
-                text = text_el.inner_text(timeout=2_000).strip()[:500]
-            except Exception:
-                text = ""
+            # Text
+            text = _first_text(container, TEXT_SELECTORS)[:500]
 
-            # --- Engagement counts ---
-            likes = comments = shares = 0
-            try:
-                reaction_el = container.locator("span.social-details-social-counts__reactions-count").first
-                likes = parse_count(reaction_el.inner_text(timeout=2_000))
-            except Exception:
-                pass
-            try:
-                comment_el = container.locator(
-                    "li.social-details-social-counts__item button[aria-label*='comment']"
-                ).first
-                raw = comment_el.get_attribute("aria-label") or ""
-                m = re.search(r"(\d[\d,.KkMm]*)", raw)
-                comments = parse_count(m.group(1)) if m else 0
-            except Exception:
-                pass
-            try:
-                share_el = container.locator(
-                    "li.social-details-social-counts__item button[aria-label*='repost']"
-                ).first
-                raw = share_el.get_attribute("aria-label") or ""
-                m = re.search(r"(\d[\d,.KkMm]*)", raw)
-                shares = parse_count(m.group(1)) if m else 0
-            except Exception:
-                pass
+            # Engagement
+            likes = _extract_count_from_aria(container, "reaction")
+            if likes == 0:
+                likes = _extract_count_from_aria(container, "like")
+            comments = _extract_count_from_aria(container, "comment")
+            shares = _extract_count_from_aria(container, "repost")
+            if shares == 0:
+                shares = _extract_count_from_aria(container, "share")
 
-            score = likes + comments + shares
-            posts.append(
-                {
-                    "url": post_url,
-                    "text": text,
-                    "date": post_date.strftime("%Y-%m-%d") if post_date else "unknown",
-                    "likes": likes,
-                    "comments": comments,
-                    "shares": shares,
-                    "score": score,
-                }
-            )
-            new_found = True
+            posts.append({
+                "url": post_url,
+                "text": text,
+                "date": post_date.strftime("%Y-%m-%d") if post_date else "unknown",
+                "likes": likes,
+                "comments": comments,
+                "shares": shares,
+                "score": likes + comments + shares,
+            })
 
-        if not new_found:
+        # Stop scrolling if no new containers appeared
+        if len(posts) == prev_count and scroll_attempts > 0:
             break
+        prev_count = len(posts)
 
-        # Scroll down to load more posts
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(2_000)
+        page.wait_for_timeout(2_500)
         scroll_attempts += 1
 
+    print(f"    Collected {len(posts)} posts")
     return posts
 
 
+def _save_debug(page: Page, slug: str) -> None:
+    html_path = Path(f"debug_{slug}.html")
+    png_path = Path(f"debug_{slug}.png")
+    html_path.write_text(page.content(), encoding="utf-8")
+    page.screenshot(path=str(png_path), full_page=False)
+    print(f"    [debug] Saved {html_path} and {png_path}")
+
+
 # ---------------------------------------------------------------------------
-# Report generation
+# Report
 # ---------------------------------------------------------------------------
 
 def generate_report(results: dict[str, list[dict]], output_path: Path, days: int) -> None:
@@ -233,27 +271,31 @@ def generate_report(results: dict[str, list[dict]], output_path: Path, days: int
     ]
 
     for slug, posts in results.items():
-        lines.append(f"## [{slug}]({LINKEDIN_BASE}/in/{slug}/)")
+        lines.append(f"## [{slug}]({LINKEDIN_BASE}/in/{slug}/recent-activity/shares/)")
         lines.append("")
 
         if not posts:
             lines.append("_No posts found in the selected period._")
             lines.append("")
+            lines.append("---")
+            lines.append("")
             continue
 
         for rank, post in enumerate(posts, start=1):
-            text_preview = post["text"].replace("\n", " ").strip()
-            if len(text_preview) > 200:
-                text_preview = text_preview[:200] + "…"
+            preview = post["text"].replace("\n", " ").strip()
+            if len(preview) > 200:
+                preview = preview[:200] + "…"
 
             lines += [
-                f"### #{rank} — Score: {post['score']}",
+                f"### #{rank} — Score {post['score']}",
                 "",
-                f"- **Date:** {post['date']}",
-                f"- **Likes:** {post['likes']} | **Comments:** {post['comments']} | **Shares:** {post['shares']}",
-                f"- **URL:** [{post['url']}]({post['url']})" if post["url"] else "- **URL:** _unavailable_",
+                f"| Date | Likes | Comments | Shares |",
+                f"|------|-------|----------|--------|",
+                f"| {post['date']} | {post['likes']} | {post['comments']} | {post['shares']} |",
                 "",
-                f"> {text_preview}" if text_preview else "> _(no text)_",
+                f"**URL:** [{post['url']}]({post['url']})" if post["url"] else "**URL:** _unavailable_",
+                "",
+                f"> {preview}" if preview else "> _(no text)_",
                 "",
             ]
 
@@ -270,12 +312,17 @@ def generate_report(results: dict[str, list[dict]], output_path: Path, days: int
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="LinkedIn Watch — engagement scraper")
-    parser.add_argument("--profiles", default="profiles.txt", help="Path to profiles file")
-    parser.add_argument("--output", default="report.md", help="Output report path")
-    parser.add_argument("--days", type=int, default=15, help="Look-back window in days")
-    parser.add_argument("--cookies", default=str(COOKIE_FILE), help="Cookie file path")
-    parser.add_argument("--headless", action="store_true", help="Run browser in headless mode")
-    parser.add_argument("--top", type=int, default=3, help="Number of top posts to keep per profile")
+    parser.add_argument("--profiles", default="profiles.txt")
+    parser.add_argument("--output", default="report.md")
+    parser.add_argument("--days", type=int, default=15)
+    parser.add_argument("--top", type=int, default=3)
+    parser.add_argument("--cookies", default=str(COOKIE_FILE))
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Save page HTML + screenshot per profile for selector debugging",
+    )
     args = parser.parse_args()
 
     profiles_path = Path(args.profiles)
@@ -285,13 +332,12 @@ def main() -> None:
 
     slugs = parse_profiles(profiles_path)
     if not slugs:
-        print("[!] No profiles found in the profiles file.")
+        print("[!] No profiles found in profiles file.")
         sys.exit(1)
 
-    print(f"[*] Profiles to scrape: {slugs}")
+    print(f"[*] Profiles: {slugs}")
     cookie_file = Path(args.cookies)
     since = datetime.now(timezone.utc) - timedelta(days=args.days)
-
     results: dict[str, list[dict]] = {}
 
     with sync_playwright() as pw:
@@ -306,7 +352,6 @@ def main() -> None:
             locale="en-US",
         )
 
-        # Load saved cookies if available
         if cookie_file.exists():
             print(f"[*] Loading cookies from {cookie_file}")
             load_cookies(context, cookie_file)
@@ -315,12 +360,11 @@ def main() -> None:
         ensure_logged_in(page, context, cookie_file)
 
         for slug in slugs:
-            print(f"\n[*] Scraping profile: {slug}")
-            posts = scrape_profile(page, slug, since)
-            # Sort by engagement score descending; keep top N
+            print(f"\n[*] {slug}")
+            posts = scrape_profile(page, slug, since, debug=args.debug)
             posts.sort(key=lambda p: p["score"], reverse=True)
             results[slug] = posts[: args.top]
-            print(f"    Found {len(posts)} posts → kept top {len(results[slug])}")
+            print(f"    → kept top {len(results[slug])}")
 
         browser.close()
 
