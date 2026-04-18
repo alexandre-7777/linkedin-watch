@@ -8,14 +8,13 @@ Usage:
     python scraper.py --debug             # saves page.html + screenshot per profile
     python scraper.py --days 15 --top 3
 """
-from __future__ import annotations
-
 import argparse
 import json
 import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Dict, List, Optional, Set
 
 from playwright.sync_api import sync_playwright, Page, BrowserContext, TimeoutError as PWTimeout
 
@@ -27,7 +26,7 @@ COOKIE_FILE = Path("linkedin_cookies.json")
 # Helpers
 # ---------------------------------------------------------------------------
 
-def parse_profiles(path: Path) -> list[str]:
+def parse_profiles(path: Path) -> List[str]:
     slugs = []
     for line in path.read_text().splitlines():
         line = line.strip()
@@ -38,7 +37,7 @@ def parse_profiles(path: Path) -> list[str]:
     return slugs
 
 
-def parse_relative_time(text: str) -> datetime | None:
+def parse_relative_time(text: str) -> Optional[datetime]:
     """Parse LinkedIn relative timestamps like '2d', '1w', '3h' → UTC datetime."""
     now = datetime.now(timezone.utc)
     text = text.lower().strip()
@@ -119,7 +118,7 @@ TIME_SELECTORS = [
 ]
 
 
-def _first_text(container, selectors: list[str], timeout: int = 2_000) -> str:
+def _first_text(container, selectors: List[str], timeout: int = 2_000) -> str:
     for sel in selectors:
         try:
             el = container.locator(sel).first
@@ -145,7 +144,7 @@ def _extract_count_from_aria(container, keyword: str) -> int:
     return 0
 
 
-def scrape_profile(page: Page, slug: str, since: datetime, debug: bool = False) -> list[dict]:
+def scrape_profile(page: Page, slug: str, since: datetime, debug: bool = False) -> List[dict]:
     url = f"{LINKEDIN_BASE}/in/{slug}/recent-activity/shares/"
     print(f"  → {url}")
 
@@ -181,8 +180,8 @@ def scrape_profile(page: Page, slug: str, since: datetime, debug: bool = False) 
         POST_CONTAINER_SELECTORS[0],
     )
 
-    posts: list[dict] = []
-    seen_urls: set[str] = set()
+    posts: List[dict] = []
+    seen_urls: Set[str] = set()
     prev_count = 0
     scroll_attempts = 0
     max_scroll = 25
@@ -259,7 +258,7 @@ def _save_debug(page: Page, slug: str) -> None:
 # Report
 # ---------------------------------------------------------------------------
 
-def generate_report(results: dict[str, list[dict]], output_path: Path, days: int) -> None:
+def generate_report(results: Dict[str, List[dict]], output_path: Path, days: int) -> None:
     lines = [
         "# LinkedIn Watch — Engagement Report",
         "",
@@ -339,7 +338,7 @@ def main() -> None:
     print(f"[*] Profiles: {slugs}")
     cookie_file = Path(args.cookies)
     since = datetime.now(timezone.utc) - timedelta(days=args.days)
-    results: dict[str, list[dict]] = {}
+    results: Dict[str, List[dict]] = {}
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=args.headless)
