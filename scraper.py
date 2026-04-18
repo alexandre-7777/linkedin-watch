@@ -8,6 +8,7 @@ Usage:
     python scraper.py --debug             # saves page.html + screenshot per profile
     python scraper.py --days 15 --top 3
 """
+from __future__ import annotations
 
 import argparse
 import json
