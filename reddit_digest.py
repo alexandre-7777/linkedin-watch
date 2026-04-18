@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Weekly Reddit editorial digest — fetches top posts, summarizes with Claude, posts to Slack."""
+"""Weekly Reddit editorial digest — fetches top posts via Reddit OAuth, summarizes with Claude, posts to Slack."""
 
 import os
 import time
 import json
 import urllib.request
+import urllib.parse
 from datetime import datetime, timedelta
 
 import anthropic
+import praw
 
 SUBREDDITS = [
     "Wordpress",
@@ -21,39 +23,43 @@ SUBREDDITS = [
 MAX_AGE_SECONDS = 7 * 24 * 3600  # 7 days
 MIN_SCORE = 20
 MIN_COMMENTS = 10
-USER_AGENT = "RedditDigestBot/1.0 by alexandre@web-ia.com"
 
 
-def fetch_subreddit(subreddit: str) -> list[dict]:
-    url = f"https://www.reddit.com/r/{subreddit}/top.json?t=week&limit=25"
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read())
-    return [p["data"] for p in data["data"]["children"]]
+def get_reddit():
+    return praw.Reddit(
+        client_id=os.environ["REDDIT_CLIENT_ID"],
+        client_secret=os.environ["REDDIT_CLIENT_SECRET"],
+        user_agent="RedditDigestBot/1.0 by alexandre@web-ia.com",
+    )
 
 
-def filter_posts(posts: list[dict]) -> list[dict]:
+def fetch_subreddit(reddit, subreddit: str) -> list[dict]:
     now = time.time()
-    result = []
-    for p in posts:
-        age = now - p.get("created_utc", 0)
+    posts = []
+    for submission in reddit.subreddit(subreddit).top(time_filter="week", limit=25):
+        age = now - submission.created_utc
         if age > MAX_AGE_SECONDS:
             continue
-        if p.get("score", 0) < MIN_SCORE and p.get("num_comments", 0) < MIN_COMMENTS:
+        if submission.score < MIN_SCORE and submission.num_comments < MIN_COMMENTS:
             continue
-        result.append(p)
-    return result
+        posts.append({
+            "title": submission.title,
+            "url": f"https://reddit.com{submission.permalink}",
+            "score": submission.score,
+            "num_comments": submission.num_comments,
+            "selftext": submission.selftext[:200] if submission.selftext else "",
+        })
+    return posts
 
 
 def build_posts_text(subreddit: str, posts: list[dict]) -> str:
     lines = [f"Subreddit: r/{subreddit}"]
     for p in posts[:5]:
         lines.append(
-            f"- [{p['title']}](https://reddit.com{p['permalink']}) "
-            f"| score: {p['score']} | commentaires: {p['num_comments']}"
+            f"- [{p['title']}]({p['url']}) | score: {p['score']} | commentaires: {p['num_comments']}"
         )
-        if p.get("selftext"):
-            lines.append(f"  Extrait: {p['selftext'][:200]}")
+        if p["selftext"]:
+            lines.append(f"  Extrait: {p['selftext']}")
     return "\n".join(lines)
 
 
@@ -78,7 +84,6 @@ Rédige une revue de presse hebdomadaire en français pour Slack :
 - Ignore les subreddits sans posts qualifiants
 - Termine par : _Prochain digest : vendredi prochain à 7h._
 - Sois sélectif et éditorial : 3 excellents items valent mieux que 15 médiocres
-- Utilise les emojis Slack avec parcimonie pour structurer (ex: 📝 📢 🧠)
 """
 
     message = client.messages.create(
@@ -104,15 +109,15 @@ def post_to_slack(text: str):
 
 def main():
     print("Démarrage de la revue Reddit hebdomadaire...")
+    reddit = get_reddit()
     subreddit_posts: dict[str, list[dict]] = {}
 
     for sub in SUBREDDITS:
         print(f"  Fetching r/{sub}...")
         try:
-            posts = fetch_subreddit(sub)
-            filtered = filter_posts(posts)
-            subreddit_posts[sub] = filtered
-            print(f"    {len(filtered)} posts qualifiants sur {len(posts)}")
+            posts = fetch_subreddit(reddit, sub)
+            subreddit_posts[sub] = posts
+            print(f"    {len(posts)} posts qualifiants")
         except Exception as e:
             print(f"    Erreur r/{sub}: {e}")
             subreddit_posts[sub] = []
@@ -131,10 +136,6 @@ def main():
 
     print("Génération du digest avec Claude...")
     digest = generate_digest(subreddit_posts, date_fr)
-
-    if not digest:
-        print("Digest vide. Message non envoyé.")
-        return
 
     print("Envoi sur Slack...")
     post_to_slack(digest)
