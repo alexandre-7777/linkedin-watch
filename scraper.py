@@ -321,28 +321,26 @@ def send_email(
     results: Dict[str, List[dict]],
     recipient: str,
     days: int,
+    sender: str = "alxrnt@gmail.com",
 ) -> None:
-    """Send the digest by email using credentials from environment variables.
+    """Send the digest by email via Gmail SMTP.
 
     Required env vars:
-        SMTP_HOST     — e.g. smtp.gmail.com
-        SMTP_PORT     — e.g. 587
-        SMTP_USER     — sender address
-        SMTP_PASSWORD — app password or SMTP password
+        SMTP_PASSWORD — Gmail App Password for the sender account
+    Optional env vars (override defaults):
+        SMTP_HOST     — default: smtp.gmail.com
+        SMTP_PORT     — default: 587
     """
-    host = os.environ.get("SMTP_HOST", "")
+    host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
     port = int(os.environ.get("SMTP_PORT", "587"))
-    user = os.environ.get("SMTP_USER", "")
+    user = sender
     password = os.environ.get("SMTP_PASSWORD", "")
 
-    if not all([host, user, password]):
+    if not password:
         print(
-            "\n[!] Email not sent — set SMTP_HOST, SMTP_USER, SMTP_PASSWORD env vars.\n"
-            "    Example (Gmail with App Password):\n"
-            "      export SMTP_HOST=smtp.gmail.com\n"
-            "      export SMTP_PORT=587\n"
-            "      export SMTP_USER=you@gmail.com\n"
-            "      export SMTP_PASSWORD=xxxx-xxxx-xxxx-xxxx"
+            "\n[!] Email not sent — SMTP_PASSWORD env var is missing.\n"
+            "    Generate a Gmail App Password at: myaccount.google.com/apppasswords\n"
+            "    Then run:  export SMTP_PASSWORD=xxxx-xxxx-xxxx-xxxx"
         )
         return
 
@@ -407,9 +405,20 @@ def main() -> None:
     )
     parser.add_argument(
         "--email",
-        default="",
+        default="alexandre@web-ia.com",
         metavar="ADDRESS",
-        help="Send the digest to this email address when done (requires SMTP_* env vars)",
+        help="Recipient email address (default: alexandre@web-ia.com)",
+    )
+    parser.add_argument(
+        "--smtp-user",
+        default=os.environ.get("SMTP_USER", "alxrnt@gmail.com"),
+        metavar="ADDRESS",
+        help="Sender Gmail address (default: alxrnt@gmail.com)",
+    )
+    parser.add_argument(
+        "--no-email",
+        action="store_true",
+        help="Skip email sending even if --email is set",
     )
     args = parser.parse_args()
 
@@ -458,8 +467,8 @@ def main() -> None:
 
     report_md = generate_report(results, Path(args.output), args.days)
 
-    if args.email:
-        send_email(report_md, results, args.email, args.days)
+    if args.email and not args.no_email:
+        send_email(report_md, results, args.email, args.days, sender=args.smtp_user)
 
 
 if __name__ == "__main__":
