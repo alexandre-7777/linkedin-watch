@@ -2,25 +2,26 @@
 """Weekly Reddit editorial digest — fetches top posts via RSS, summarizes with Claude, posts to Slack."""
 
 import os
+import re
 import time
 import json
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 import anthropic
 
+# (subreddit, thème en français pour le digest)
 SUBREDDITS = [
-    "Wordpress",
-    "ClaudeAI",
-    "airtable",
-    "Infomaniak",
-    "neurodiversity",
-    "HighFunctioning",
+    ("Wordpress", "WordPress"),
+    ("ClaudeAI", "Claude AI"),
+    ("airtable", "Airtable"),
+    ("Infomaniak", "Infomaniak"),
+    ("neurodiversity", "Neuro-atypisme"),
+    ("Giftedness", "HPI"),
 ]
 
 MAX_AGE_SECONDS = 7 * 24 * 3600  # 7 days
-MIN_SCORE = 5  # RSS doesn't include score, so we keep all posts and let Claude curate
 BROWSER_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -43,7 +44,6 @@ def fetch_subreddit_rss(subreddit: str) -> list[dict]:
     posts = []
 
     for entry in root.findall("atom:entry", ns):
-        # Parse published date
         published = entry.findtext("atom:published", default="", namespaces=ns)
         try:
             dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
@@ -59,8 +59,6 @@ def fetch_subreddit_rss(subreddit: str) -> list[dict]:
         link = link_el.attrib.get("href", "") if link_el is not None else ""
         content_el = entry.find("atom:content", ns)
         body = content_el.text or "" if content_el is not None else ""
-        # Strip HTML tags crudely for preview
-        import re
         body_text = re.sub(r"<[^>]+>", " ", body)[:300].strip()
 
         posts.append({
@@ -73,8 +71,8 @@ def fetch_subreddit_rss(subreddit: str) -> list[dict]:
     return posts
 
 
-def build_posts_text(subreddit: str, posts: list[dict]) -> str:
-    lines = [f"Subreddit: r/{subreddit}"]
+def build_posts_text(subreddit: str, theme_fr: str, posts: list[dict]) -> str:
+    lines = [f"Thème : {theme_fr} (r/{subreddit})"]
     for p in posts[:8]:
         lines.append(f"- [{p['title']}]({p['url']}) — publié le {p['published'][:10]}")
         if p["preview"]:
@@ -82,25 +80,25 @@ def build_posts_text(subreddit: str, posts: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def generate_digest(subreddit_posts: dict[str, list[dict]], date_fr: str) -> str:
+def generate_digest(subreddit_posts: dict[str, tuple[str, list[dict]]], date_fr: str) -> str:
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
     content_blocks = [
-        build_posts_text(sub, posts)
-        for sub, posts in subreddit_posts.items()
+        build_posts_text(sub, theme, posts)
+        for sub, (theme, posts) in subreddit_posts.items()
         if posts
     ]
 
     prompt = f"""Tu es un rédacteur de revue de presse tech pour Alexandre.
-Voici les posts Reddit de la semaine (moins de 7 jours) récupérés via RSS :
+Voici les posts Reddit de la semaine (moins de 7 jours), organisés par thème :
 
 {chr(10).join(content_blocks)}
 
 Rédige une revue de presse hebdomadaire en français pour Slack :
 - Commence par : *Revue Reddit — semaine du {date_fr}*
-- Une section par subreddit avec du contenu notable
+- Une section par thème avec du contenu notable (utilise le nom du thème en français comme titre de section)
 - Pour chaque post retenu : titre avec lien cliquable, 2-3 phrases éditoriales (sujet, pourquoi notable, ce que ça apporte)
-- Ignore les subreddits sans posts intéressants
+- Ignore les thèmes sans posts intéressants cette semaine
 - Termine par : _Prochain digest : vendredi prochain à 7h._
 - Sois sélectif et éditorial : 3 excellents items valent mieux que 15 médiocres
 - Utilise le format Slack (*gras*, _italique_, liens)
@@ -129,19 +127,19 @@ def post_to_slack(text: str):
 
 def main():
     print("Démarrage de la revue Reddit hebdomadaire (via RSS)...")
-    subreddit_posts: dict[str, list[dict]] = {}
+    subreddit_posts: dict[str, tuple[str, list[dict]]] = {}
 
-    for sub in SUBREDDITS:
-        print(f"  Fetching r/{sub}...")
+    for sub, theme in SUBREDDITS:
+        print(f"  Fetching r/{sub} ({theme})...")
         try:
             posts = fetch_subreddit_rss(sub)
-            subreddit_posts[sub] = posts
+            subreddit_posts[sub] = (theme, posts)
             print(f"    {len(posts)} posts récents trouvés")
         except Exception as e:
             print(f"    Erreur r/{sub}: {e}")
-            subreddit_posts[sub] = []
+            subreddit_posts[sub] = (theme, [])
 
-    total = sum(len(p) for p in subreddit_posts.values())
+    total = sum(len(p) for _, p in subreddit_posts.values())
     if total == 0:
         print("Aucun post récent. Message non envoyé.")
         return
