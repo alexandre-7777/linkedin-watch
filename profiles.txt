@@ -1,8 +1,24 @@
-# LinkedIn profiles to watch — one per line
-# Accepted formats: full URL or slug
-# Example:
-# https://www.linkedin.com/in/williamhgates
-# jeffweiner08
-
-williamhgates
-jeffweiner08
+leroynicolas-
+anthonymathiot
+alexandrechupin
+audrey-guilbaud85
+ghiles-moussaoui-b36218250
+germainchittaro
+juliendesousaco
+davidgrossi
+thomascarrere
+manon-mercier-product-manager
+joanny-thevenin
+sariha
+leaclauss
+lea-grondin
+sigrine-felix
+sandiegiacobi
+laurie-giacobi
+khalil-ahmed-fr
+kim-david-nguyen
+baptistebca
+cyril-lefèvre
+marine-bony
+pauline-trequesser
+valentin-heinly-39774a8a
