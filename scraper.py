@@ -10,9 +10,13 @@ Usage:
 """
 import argparse
 import json
+import os
 import re
+import smtplib
 import sys
 from datetime import datetime, timedelta, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
@@ -302,8 +306,86 @@ def generate_report(results: Dict[str, List[dict]], output_path: Path, days: int
         lines.append("---")
         lines.append("")
 
-    output_path.write_text("\n".join(lines), encoding="utf-8")
+    content = "\n".join(lines)
+    output_path.write_text(content, encoding="utf-8")
     print(f"\n[✓] Report written to {output_path}")
+    return content
+
+
+# ---------------------------------------------------------------------------
+# Email
+# ---------------------------------------------------------------------------
+
+def send_email(
+    report_md: str,
+    results: Dict[str, List[dict]],
+    recipient: str,
+    days: int,
+) -> None:
+    """Send the digest by email using credentials from environment variables.
+
+    Required env vars:
+        SMTP_HOST     — e.g. smtp.gmail.com
+        SMTP_PORT     — e.g. 587
+        SMTP_USER     — sender address
+        SMTP_PASSWORD — app password or SMTP password
+    """
+    host = os.environ.get("SMTP_HOST", "")
+    port = int(os.environ.get("SMTP_PORT", "587"))
+    user = os.environ.get("SMTP_USER", "")
+    password = os.environ.get("SMTP_PASSWORD", "")
+
+    if not all([host, user, password]):
+        print(
+            "\n[!] Email not sent — set SMTP_HOST, SMTP_USER, SMTP_PASSWORD env vars.\n"
+            "    Example (Gmail with App Password):\n"
+            "      export SMTP_HOST=smtp.gmail.com\n"
+            "      export SMTP_PORT=587\n"
+            "      export SMTP_USER=you@gmail.com\n"
+            "      export SMTP_PASSWORD=xxxx-xxxx-xxxx-xxxx"
+        )
+        return
+
+    subject = f"LinkedIn Watch — digest {datetime.now().strftime('%Y-%m-%d')} ({days} days)"
+
+    # Build a compact HTML body from the results
+    html_parts = [
+        "<html><body>",
+        f"<h2>LinkedIn Watch — top posts ({days} derniers jours)</h2>",
+    ]
+    for slug, posts in results.items():
+        html_parts.append(f"<h3><a href='{LINKEDIN_BASE}/in/{slug}/'>{slug}</a></h3>")
+        if not posts:
+            html_parts.append("<p><em>Aucun post trouvé.</em></p>")
+            continue
+        for rank, post in enumerate(posts, 1):
+            preview = post["text"].replace("\n", " ").strip()[:200]
+            url = post["url"] or "#"
+            html_parts.append(
+                f"<p><strong>#{rank} — Score {post['score']}</strong> "
+                f"({post['date']}) "
+                f"👍 {post['likes']} 💬 {post['comments']} 🔁 {post['shares']}<br>"
+                f"<a href='{url}'>{url}</a><br>"
+                f"<em>{preview}</em></p>"
+            )
+    html_parts.append("</body></html>")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = user
+    msg["To"] = recipient
+    msg.attach(MIMEText(report_md, "plain", "utf-8"))
+    msg.attach(MIMEText("\n".join(html_parts), "html", "utf-8"))
+
+    try:
+        with smtplib.SMTP(host, port) as smtp:
+            smtp.ehlo()
+            smtp.starttls()
+            smtp.login(user, password)
+            smtp.sendmail(user, recipient, msg.as_string())
+        print(f"[✓] Digest sent to {recipient}")
+    except Exception as exc:
+        print(f"[!] Failed to send email: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +404,12 @@ def main() -> None:
         "--debug",
         action="store_true",
         help="Save page HTML + screenshot per profile for selector debugging",
+    )
+    parser.add_argument(
+        "--email",
+        default="",
+        metavar="ADDRESS",
+        help="Send the digest to this email address when done (requires SMTP_* env vars)",
     )
     args = parser.parse_args()
 
@@ -368,7 +456,10 @@ def main() -> None:
 
         browser.close()
 
-    generate_report(results, Path(args.output), args.days)
+    report_md = generate_report(results, Path(args.output), args.days)
+
+    if args.email:
+        send_email(report_md, results, args.email, args.days)
 
 
 if __name__ == "__main__":
