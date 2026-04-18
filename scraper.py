@@ -11,6 +11,7 @@ LinkedIn requires authentication. On the first run, the browser opens so you can
 log in manually. Cookies are then saved to linkedin_cookies.json so subsequent
 runs are headless.
 """
+from __future__ import annotations
 
 import argparse
 import json
