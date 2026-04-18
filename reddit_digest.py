@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Weekly Reddit editorial digest — fetches top posts via Reddit OAuth, summarizes with Claude, posts to Slack."""
+"""Weekly Reddit editorial digest — fetches top posts via RSS, summarizes with Claude, posts to Slack."""
 
 import os
 import time
 import json
 import urllib.request
-import urllib.parse
-from datetime import datetime, timedelta
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 
 import anthropic
-import praw
 
 SUBREDDITS = [
     "Wordpress",
@@ -21,45 +20,65 @@ SUBREDDITS = [
 ]
 
 MAX_AGE_SECONDS = 7 * 24 * 3600  # 7 days
-MIN_SCORE = 20
-MIN_COMMENTS = 10
+MIN_SCORE = 5  # RSS doesn't include score, so we keep all posts and let Claude curate
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 
-def get_reddit():
-    return praw.Reddit(
-        client_id=os.environ["REDDIT_CLIENT_ID"],
-        client_secret=os.environ["REDDIT_CLIENT_SECRET"],
-        user_agent="RedditDigestBot/1.0 by alexandre@web-ia.com",
-    )
+def fetch_subreddit_rss(subreddit: str) -> list[dict]:
+    url = f"https://www.reddit.com/r/{subreddit}/top.rss?t=week&limit=25"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": BROWSER_UA,
+        "Accept": "application/rss+xml, application/xml, text/xml, */*",
+    })
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        content = resp.read()
 
-
-def fetch_subreddit(reddit, subreddit: str) -> list[dict]:
+    root = ET.fromstring(content)
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
     now = time.time()
     posts = []
-    for submission in reddit.subreddit(subreddit).top(time_filter="week", limit=25):
-        age = now - submission.created_utc
+
+    for entry in root.findall("atom:entry", ns):
+        # Parse published date
+        published = entry.findtext("atom:published", default="", namespaces=ns)
+        try:
+            dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
+            age = now - dt.timestamp()
+        except ValueError:
+            age = 0
+
         if age > MAX_AGE_SECONDS:
             continue
-        if submission.score < MIN_SCORE and submission.num_comments < MIN_COMMENTS:
-            continue
+
+        title = entry.findtext("atom:title", default="", namespaces=ns)
+        link_el = entry.find("atom:link", ns)
+        link = link_el.attrib.get("href", "") if link_el is not None else ""
+        content_el = entry.find("atom:content", ns)
+        body = content_el.text or "" if content_el is not None else ""
+        # Strip HTML tags crudely for preview
+        import re
+        body_text = re.sub(r"<[^>]+>", " ", body)[:300].strip()
+
         posts.append({
-            "title": submission.title,
-            "url": f"https://reddit.com{submission.permalink}",
-            "score": submission.score,
-            "num_comments": submission.num_comments,
-            "selftext": submission.selftext[:200] if submission.selftext else "",
+            "title": title,
+            "url": link,
+            "published": published,
+            "preview": body_text,
         })
+
     return posts
 
 
 def build_posts_text(subreddit: str, posts: list[dict]) -> str:
     lines = [f"Subreddit: r/{subreddit}"]
-    for p in posts[:5]:
-        lines.append(
-            f"- [{p['title']}]({p['url']}) | score: {p['score']} | commentaires: {p['num_comments']}"
-        )
-        if p["selftext"]:
-            lines.append(f"  Extrait: {p['selftext']}")
+    for p in posts[:8]:
+        lines.append(f"- [{p['title']}]({p['url']}) — publié le {p['published'][:10]}")
+        if p["preview"]:
+            lines.append(f"  Aperçu: {p['preview'][:200]}")
     return "\n".join(lines)
 
 
@@ -73,17 +92,18 @@ def generate_digest(subreddit_posts: dict[str, list[dict]], date_fr: str) -> str
     ]
 
     prompt = f"""Tu es un rédacteur de revue de presse tech pour Alexandre.
-Voici les posts Reddit notables de la semaine (score > {MIN_SCORE} ou > {MIN_COMMENTS} commentaires, moins de 7 jours) :
+Voici les posts Reddit de la semaine (moins de 7 jours) récupérés via RSS :
 
 {chr(10).join(content_blocks)}
 
 Rédige une revue de presse hebdomadaire en français pour Slack :
 - Commence par : *Revue Reddit — semaine du {date_fr}*
-- Une section par subreddit avec du contenu notable (utilise *bold* pour les titres Slack)
-- Pour chaque post retenu : titre avec lien cliquable, 2-3 phrases éditoriales (sujet, pourquoi notable, réaction communauté)
-- Ignore les subreddits sans posts qualifiants
+- Une section par subreddit avec du contenu notable
+- Pour chaque post retenu : titre avec lien cliquable, 2-3 phrases éditoriales (sujet, pourquoi notable, ce que ça apporte)
+- Ignore les subreddits sans posts intéressants
 - Termine par : _Prochain digest : vendredi prochain à 7h._
 - Sois sélectif et éditorial : 3 excellents items valent mieux que 15 médiocres
+- Utilise le format Slack (*gras*, _italique_, liens)
 """
 
     message = client.messages.create(
@@ -108,23 +128,22 @@ def post_to_slack(text: str):
 
 
 def main():
-    print("Démarrage de la revue Reddit hebdomadaire...")
-    reddit = get_reddit()
+    print("Démarrage de la revue Reddit hebdomadaire (via RSS)...")
     subreddit_posts: dict[str, list[dict]] = {}
 
     for sub in SUBREDDITS:
         print(f"  Fetching r/{sub}...")
         try:
-            posts = fetch_subreddit(reddit, sub)
+            posts = fetch_subreddit_rss(sub)
             subreddit_posts[sub] = posts
-            print(f"    {len(posts)} posts qualifiants")
+            print(f"    {len(posts)} posts récents trouvés")
         except Exception as e:
             print(f"    Erreur r/{sub}: {e}")
             subreddit_posts[sub] = []
 
     total = sum(len(p) for p in subreddit_posts.values())
     if total == 0:
-        print("Aucun post qualifiant cette semaine. Message non envoyé.")
+        print("Aucun post récent. Message non envoyé.")
         return
 
     monday = datetime.now() - timedelta(days=datetime.now().weekday())

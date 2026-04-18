@@ -18,12 +18,10 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install anthropic praw
+        run: pip install anthropic
 
       - name: Run Reddit digest
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
-          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
         run: python reddit_digest.py
